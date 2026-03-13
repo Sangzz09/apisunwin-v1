@@ -1,0 +1,21 @@
+{
+  "name": "sicbo-ultra-ai",
+  "version": "2.0.0",
+  "description": "SicBo Ultra AI Prediction Server",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.2",
+    "cors": "^2.8.5",
+    "express": "^4.19.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.4"
+  },
+  "author": "@sewdangcap",
+  "license": "ISC"
+}
