@@ -483,6 +483,150 @@ app.get("/api/accuracy", (req, res) => {
   })
 })
 
+// ============================================================
+// CẦU NHẬN DẠNG - dùng cho /sunlon
+// ============================================================
+function detectCau(arr) {
+  if (arr.length < 4) return { name: "chưa_đủ_dữ_liệu", predict: arr[arr.length - 1] || "Tài" }
+
+  const w = arr.slice(-12)
+
+  // ---- Cầu bệt: cùng kết quả liên tiếp >= 3 ----
+  let betLen = 1
+  for (let i = w.length - 2; i >= 0; i--) {
+    if (w[i] === w[w.length - 1]) betLen++
+    else break
+  }
+  if (betLen >= 3) {
+    return {
+      name: "cầu_bệt",
+      predict: w[w.length - 1], // tiếp tục theo cầu bệt
+      streak: betLen
+    }
+  }
+
+  // ---- Cầu đan xen: T X T X T X ----
+  const last6 = w.slice(-6)
+  const isAlternating = last6.every((v, i) => i === 0 || v !== last6[i - 1])
+  if (isAlternating && last6.length >= 4) {
+    const next = last6[last6.length - 1] === "Tài" ? "Xỉu" : "Tài"
+    return { name: "cầu_đan_xen", predict: next }
+  }
+
+  // ---- Cầu 1-2: T XX T XX hoặc X TT X TT ----
+  const last6str = w.slice(-6).join(",")
+  const p12a = ["Tài,Xỉu,Xỉu,Tài,Xỉu,Xỉu", "Xỉu,Tài,Tài,Xỉu,Tài,Tài"]
+  if (p12a.includes(last6str)) {
+    const next = w[w.length - 1] === "Xỉu" ? "Tài" : "Xỉu"
+    return { name: "cầu_1_2", predict: next }
+  }
+
+  // ---- Cầu 2-1: TT X TT X hoặc XX T XX T ----
+  const p21a = ["Tài,Tài,Xỉu,Tài,Tài,Xỉu", "Xỉu,Xỉu,Tài,Xỉu,Xỉu,Tài"]
+  if (p21a.includes(last6str)) {
+    const next = w[w.length - 1] === "Tài" ? "Xỉu" : "Tài"
+    return { name: "cầu_2_1", predict: w[w.length - 2] } // lặp lại cặp đôi
+  }
+
+  // ---- Cầu 2-2: TT XX TT XX ----
+  const last8 = w.slice(-8).join(",")
+  const p22 = ["Tài,Tài,Xỉu,Xỉu,Tài,Tài,Xỉu,Xỉu", "Xỉu,Xỉu,Tài,Tài,Xỉu,Xỉu,Tài,Tài"]
+  if (p22.includes(last8)) {
+    const next = w[w.length - 1]
+    return { name: "cầu_2_2", predict: next }
+  }
+
+  // ---- Cầu 3-3: TTT XXX TTT ----
+  const last9 = w.slice(-9).join(",")
+  const p33 = [
+    "Tài,Tài,Tài,Xỉu,Xỉu,Xỉu,Tài,Tài,Tài",
+    "Xỉu,Xỉu,Xỉu,Tài,Tài,Tài,Xỉu,Xỉu,Xỉu"
+  ]
+  if (p33.includes(last9)) {
+    return { name: "cầu_3_3", predict: w[w.length - 1] }
+  }
+
+  // ---- Cầu gãy: phát hiện vỡ cầu bệt ngắn ----
+  if (betLen === 2) {
+    const beforeStreak = w[w.length - 3]
+    const streakVal = w[w.length - 1]
+    if (beforeStreak && beforeStreak !== streakVal) {
+      return { name: "cầu_gãy", predict: streakVal } // vừa đổi, có thể tiếp tục
+    }
+  }
+
+  // ---- Không nhận dạng được ----
+  return { name: "không_rõ_cầu", predict: null }
+}
+
+// GET /sunlon - Dự đoán theo cầu
+app.get("/sunlon", (req, res) => {
+  if (history.length === 0) {
+    return res.status(503).json({ error: "no_data", message: "Chưa có dữ liệu từ nguồn" })
+  }
+
+  const last = history[history.length - 1]
+  const dice = last.dice || last.xucxac || [1, 1, 1]
+  const total = sumDice(dice)
+  const result = taiXiu(total)
+  const arr = toResults(history)
+
+  // Nhận dạng cầu
+  const cau = detectCau(arr)
+
+  // Nếu cầu không rõ, fallback sang AI ensemble
+  let duDoan = cau.predict
+  let doTinCay = "65%"
+
+  if (!duDoan) {
+    const ai = aiPredict(arr)
+    duDoan = ai.predict
+    doTinCay = ai.conf + "%"
+  } else {
+    // Tính độ tin cậy dựa trên loại cầu
+    const cauConfMap = {
+      "cầu_bệt": 70,
+      "cầu_đan_xen": 68,
+      "cầu_1_2": 66,
+      "cầu_2_1": 66,
+      "cầu_2_2": 67,
+      "cầu_3_3": 69,
+      "cầu_gãy": 62,
+    }
+    doTinCay = (cauConfMap[cau.name] || 60) + "%"
+  }
+
+  res.json({
+    phien: last.session || last.phien || history.length,
+    ket_qua: dice,
+    tong: total,
+    result,
+    du_doan: duDoan,
+    do_tin_cay: doTinCay,
+    pattern: cau.name,
+    id: "@sewdangcap"
+  })
+})
+
+// GET /sunlon/detail - Chi tiết cầu
+app.get("/sunlon/detail", (req, res) => {
+  if (history.length === 0) {
+    return res.status(503).json({ error: "no_data" })
+  }
+
+  const arr = toResults(history)
+  const cau = detectCau(arr)
+  const last10 = arr.slice(-10)
+
+  res.json({
+    cau_hien_tai: cau.name,
+    du_doan_cau: cau.predict,
+    streak: cau.streak || null,
+    lich_su_10: last10,
+    id: "@sewdangcap"
+  })
+})
+
 // GET /api/history - 50 phiên gần nhất đã xử lý
 app.get("/api/history", (req, res) => {
   const arr = toResults(history)
