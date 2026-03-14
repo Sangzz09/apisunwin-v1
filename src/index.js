@@ -10,7 +10,8 @@ const PORT = process.env.PORT || 3000
 const SOURCE = "https://meuni-basally-xzavier.ngrok-free.dev/api/history"
 
 let history = []
-let predictionLog = [] // Lưu lịch sử dự đoán để đánh giá độ chính xác
+let predictionLog = []
+let lastLoadedLength = 0 // FIX #4: track length để updateWeights đúng lúc
 
 // ============================================================
 // UTILS
@@ -25,22 +26,24 @@ function taiXiu(t) {
 
 function toResults(historyArr) {
   return historyArr.map(v => {
-    const d = v.dice || v.xucxac || [1, 1, 1]
+    // Ưu tiên field result đã có sẵn
+    if (v.result) return v.result
+    if (v.Ket_qua) return v.Ket_qua
+    // Fallback tính từ dice
+    const d = v.dice || [v.Xuc_xac_1, v.Xuc_xac_2, v.Xuc_xac_3] || [1, 1, 1]
     return taiXiu(sumDice(d))
   })
 }
 
 // ============================================================
-// 1. MARKOV CHAIN (bậc 2 - xem 2 bước trước)
+// 1. MARKOV CHAIN (bậc 2)
 // ============================================================
 function markov(data) {
-  // Markov bậc 1
   const map1 = { Tài: { Tài: 0, Xỉu: 0 }, Xỉu: { Tài: 0, Xỉu: 0 } }
   for (let i = 0; i < data.length - 1; i++) {
     map1[data[i]][data[i + 1]]++
   }
 
-  // Markov bậc 2
   const map2 = {}
   for (let i = 0; i < data.length - 2; i++) {
     const key = data[i] + "_" + data[i + 1]
@@ -51,7 +54,6 @@ function markov(data) {
   const last2 = data.slice(-2).join("_")
   let vote = null
 
-  // Ưu tiên bậc 2 nếu có đủ dữ liệu
   if (map2[last2]) {
     const m = map2[last2]
     const total = m.Tài + m.Xỉu
@@ -61,7 +63,6 @@ function markov(data) {
     }
   }
 
-  // Fallback bậc 1
   const last = data[data.length - 1]
   const m = map1[last]
   const total = m.Tài + m.Xỉu
@@ -71,13 +72,13 @@ function markov(data) {
 }
 
 // ============================================================
-// 2. TREND - Xu hướng gần nhất (trọng số tăng dần)
+// 2. TREND
 // ============================================================
 function trend(data) {
   const w = data.slice(-15)
   let tScore = 0, xScore = 0
   w.forEach((v, i) => {
-    const weight = i + 1 // Càng gần càng có trọng số cao
+    const weight = i + 1
     if (v === "Tài") tScore += weight
     else xScore += weight
   })
@@ -87,7 +88,7 @@ function trend(data) {
 }
 
 // ============================================================
-// 3. STREAK - Phát hiện chuỗi và đảo chiều
+// 3. STREAK - FIX #6: phân biệt streak 1 và 2
 // ============================================================
 function streak(data) {
   const last = data[data.length - 1]
@@ -97,33 +98,41 @@ function streak(data) {
     else break
   }
 
-  // Chuỗi 2: giữ nguyên; chuỗi 3-4: đảo; chuỗi 5+: giữ nguyên (có thể là xu hướng mạnh)
   let vote
-  if (count >= 5) vote = last
-  else if (count >= 3) vote = last === "Tài" ? "Xỉu" : "Tài"
-  else vote = last
+  if (count >= 5) {
+    vote = last // xu hướng mạnh, tiếp tục
+  } else if (count >= 3) {
+    vote = last === "Tài" ? "Xỉu" : "Tài" // đảo chiều sau 3-4
+  } else if (count === 2) {
+    vote = last === "Tài" ? "Xỉu" : "Tài" // FIX: streak 2 → có xu hướng đảo
+  } else {
+    vote = last // streak 1: giữ nguyên
+  }
 
-  const confidence = count >= 3 ? 0.65 : 0.52
+  // Confidence tăng dần theo độ dài streak có ý nghĩa
+  let confidence = 0.51
+  if (count >= 5) confidence = 0.67
+  else if (count >= 3) confidence = 0.65
+  else if (count === 2) confidence = 0.57
+
   return { vote, confidence, streakLen: count }
 }
 
 // ============================================================
-// 4. FREQUENCY - Cân bằng tần suất dài hạn
+// 4. FREQUENCY - FIX #3: đổi tên biến 'x' → 'xCount'
 // ============================================================
 function frequency(data) {
-  const recent = data.slice(-50) // Chỉ xét 50 phiên gần nhất
-  const t = recent.filter(x => x === "Tài").length
-  const x = recent.length - t
-  // Nếu một bên áp đảo, dự đoán bên còn lại sẽ bù
-  const ratio = t / recent.length
+  const recent = data.slice(-50)
+  const tCount = recent.filter(v => v === "Tài").length
+  const xCount = recent.length - tCount // FIX: không còn shadow tên
+  const ratio = tCount / recent.length
   let vote, confidence
 
   if (ratio > 0.65) { vote = "Xỉu"; confidence = ratio }
   else if (ratio < 0.35) { vote = "Tài"; confidence = 1 - ratio }
   else {
-    // Gần cân bằng, theo xu hướng gần hơn
     const last5 = data.slice(-5)
-    const t5 = last5.filter(x => x === "Tài").length
+    const t5 = last5.filter(v => v === "Tài").length
     vote = t5 >= 3 ? "Tài" : "Xỉu"
     confidence = 0.5
   }
@@ -131,12 +140,12 @@ function frequency(data) {
 }
 
 // ============================================================
-// 5. MOMENTUM - Động lượng có trọng số mũ
+// 5. MOMENTUM
 // ============================================================
 function momentum(data) {
   const l = data.slice(-8)
   let score = 0
-  const decay = 0.85 // Hệ số giảm dần
+  const decay = 0.85
   l.forEach((v, i) => {
     const w = Math.pow(decay, l.length - 1 - i)
     if (v === "Tài") score += w
@@ -149,28 +158,22 @@ function momentum(data) {
 }
 
 // ============================================================
-// 6. PATTERN MATCHING - Nhận dạng mẫu nâng cao
+// 6. PATTERN MATCHING
 // ============================================================
 function patternMatch(data) {
   const patterns = {
-    // Alternating
     "TàiXỉuTàiXỉu": "Tài",
     "XỉuTàiXỉuTài": "Xỉu",
-    // Double alternating
     "TàiTàiXỉuXỉu": "Tài",
     "XỉuXỉuTàiTài": "Xỉu",
-    // Triple break
     "TàiTàiTàiXỉu": "Xỉu",
     "XỉuXỉuXỉuTài": "Tài",
-    // Quad streak
     "TàiTàiTàiTài": "Xỉu",
     "XỉuXỉuXỉuXỉu": "Tài",
-    // 5-pattern
     "XỉuTàiTàiTàiXỉu": "Tài",
     "TàiXỉuXỉuXỉuTài": "Xỉu",
   }
 
-  // Tìm pattern khớp dài nhất
   for (let len = 5; len >= 3; len--) {
     const key = data.slice(-len).join("")
     if (patterns[key]) {
@@ -181,17 +184,15 @@ function patternMatch(data) {
 }
 
 // ============================================================
-// 7. BAYESIAN NAIVE - Xác suất Bayes đơn giản
+// 7. BAYESIAN
 // ============================================================
 function bayesian(data) {
   const n = Math.min(data.length, 100)
   const recent = data.slice(-n)
 
-  // Prior: tần suất toàn bộ
-  const tTotal = recent.filter(x => x === "Tài").length
+  const tTotal = recent.filter(v => v === "Tài").length
   const priorT = tTotal / n
 
-  // Likelihood dựa trên 3 phiên gần nhất
   const last3 = data.slice(-3).join(",")
   const seqs = []
   for (let i = 0; i < recent.length - 3; i++) {
@@ -210,13 +211,12 @@ function bayesian(data) {
     return { vote, confidence }
   }
 
-  // Fallback về prior
   const vote = priorT > 0.5 ? "Tài" : "Xỉu"
   return { vote, confidence: Math.abs(priorT - 0.5) * 2 * 0.2 + 0.5 }
 }
 
 // ============================================================
-// 8. ENTROPY / CHAOS DETECTION
+// 8. ENTROPY - FIX #5: entropy trung bình theo trend thay vì đảo
 // ============================================================
 function entropyAnalysis(data) {
   const w = data.slice(-20)
@@ -226,12 +226,10 @@ function entropyAnalysis(data) {
   }
   const entropyRatio = switches / (w.length - 1)
 
-  // Entropy cao (> 0.7): thị trường hỗn loạn -> theo trend ngắn
-  // Entropy thấp (< 0.3): thị trường có xu hướng rõ -> theo streak
   if (entropyRatio > 0.7) {
-    // Hỗn loạn: dùng short trend
+    // Hỗn loạn: theo short trend
     const last3 = data.slice(-3)
-    const t = last3.filter(x => x === "Tài").length
+    const t = last3.filter(v => v === "Tài").length
     return { vote: t >= 2 ? "Tài" : "Xỉu", confidence: 0.54, entropy: entropyRatio }
   } else if (entropyRatio < 0.3) {
     // Xu hướng mạnh: theo streak
@@ -239,12 +237,15 @@ function entropyAnalysis(data) {
     return { vote: last, confidence: 0.62, entropy: entropyRatio }
   }
 
-  const last = data[data.length - 1]
-  return { vote: last === "Tài" ? "Xỉu" : "Tài", confidence: 0.52, entropy: entropyRatio }
+  // FIX: entropy trung bình → theo weighted trend ngắn thay vì đảo ngẫu nhiên
+  const last5 = data.slice(-5)
+  const tCount = last5.filter(v => v === "Tài").length
+  const vote = tCount >= 3 ? "Tài" : "Xỉu"
+  return { vote, confidence: 0.53, entropy: entropyRatio }
 }
 
 // ============================================================
-// 9. ADAPTIVE WEIGHT - Tự điều chỉnh trọng số theo độ chính xác
+// 9. ADAPTIVE WEIGHT
 // ============================================================
 const algorithmWeights = {
   markov: 1.0,
@@ -252,12 +253,11 @@ const algorithmWeights = {
   streak: 1.0,
   frequency: 0.8,
   momentum: 1.0,
-  pattern: 1.5, // Pattern có trọng số cao hơn khi detected
+  pattern: 1.5,
   bayesian: 1.2,
   entropy: 0.9,
 }
 
-// Cập nhật trọng số dựa trên lịch sử đúng/sai
 function updateWeights(log) {
   if (log.length < 10) return
 
@@ -274,14 +274,13 @@ function updateWeights(log) {
     })
     if (total >= 5) {
       const acc = correct / total
-      // Điều chỉnh trọng số: acc 50% = 1.0, acc 70% = 1.4, acc 30% = 0.6
       algorithmWeights[algo] = Math.max(0.3, Math.min(2.0, acc * 2))
     }
   })
 }
 
 // ============================================================
-// 10. ENSEMBLE AI - Tổng hợp tất cả thuật toán
+// 10. ENSEMBLE AI
 // ============================================================
 function aiPredict(results) {
   if (results.length < 10) {
@@ -319,7 +318,6 @@ function aiPredict(results) {
     entropy: en.confidence,
   }
 
-  // Weighted voting
   let tScore = 0, xScore = 0
   Object.keys(votes).forEach(algo => {
     if (!votes[algo]) return
@@ -331,11 +329,8 @@ function aiPredict(results) {
   const total = tScore + xScore
   const predict = tScore > xScore ? "Tài" : "Xỉu"
   const rawConf = Math.max(tScore, xScore) / total
-
-  // Normalize confidence vào khoảng thực tế hơn [50-85]
   const conf = Math.round(50 + rawConf * 35)
 
-  // Đánh giá mức độ đồng thuận
   const validVotes = Object.values(votes).filter(Boolean)
   const tVotes = validVotes.filter(v => v === "Tài").length
   const xVotes = validVotes.length - tVotes
@@ -360,29 +355,91 @@ function aiPredict(results) {
 }
 
 // ============================================================
-// FETCH DATA
+// FETCH DATA - FIX: thêm headers ngrok, retry logic, log lỗi
 // ============================================================
+let loadErrorCount = 0
+
 async function load() {
   try {
-    const r = await axios.get(SOURCE, { timeout: 4000 })
-    if (Array.isArray(r.data)) {
-      const newHistory = r.data.slice(-300)
-
-      // Cập nhật prediction log nếu có dữ liệu mới
-      if (newHistory.length > history.length && predictionLog.length > 0) {
-        const lastEntry = predictionLog[predictionLog.length - 1]
-        if (!lastEntry.actual) {
-          const newLast = newHistory[newHistory.length - 1]
-          const d = newLast.dice || newLast.xucxac || [1, 1, 1]
-          lastEntry.actual = taiXiu(sumDice(d))
-          updateWeights(predictionLog)
-        }
+    const r = await axios.get(SOURCE, {
+      timeout: 6000,
+      headers: {
+        // FIX: bypass ngrok browser warning page
+        "ngrok-skip-browser-warning": "true",
+        "User-Agent": "SicboAI/2.0",
+        "Accept": "application/json",
       }
+    })
 
-      history = newHistory
+    // FIX: kiểm tra content-type để tránh nhận HTML từ ngrok warning
+    const contentType = r.headers["content-type"] || ""
+    if (!contentType.includes("application/json")) {
+      console.error("❌ Nguồn trả về không phải JSON, có thể là trang ngrok warning")
+      return
     }
+
+    const body = r.data
+
+    // Parse current session từ body.current
+    const cur = body.current
+    if (!cur) {
+      console.error("❌ Thiếu trường 'current':", JSON.stringify(body).slice(0, 200))
+      return
+    }
+
+    // Parse history array
+    let rawHistory = body.history
+    if (!Array.isArray(rawHistory) || rawHistory.length === 0) {
+      console.error("❌ Thiếu hoặc rỗng trường 'history'")
+      return
+    }
+
+    // Normalize current thành cùng format với history items
+    const currentItem = {
+      session: cur.Phien,
+      dice: [cur.Xuc_xac_1, cur.Xuc_xac_2, cur.Xuc_xac_3],
+      total: cur.Tong,
+      result: cur.Ket_qua,
+      timestamp: cur.server_time,
+    }
+
+    // Ghép history + current (tránh trùng nếu đã có)
+    const lastHistSession = rawHistory[rawHistory.length - 1]?.session
+    if (lastHistSession !== currentItem.session) {
+      rawHistory = [...rawHistory, currentItem]
+    }
+
+    const newHistory = rawHistory.slice(-300)
+    loadErrorCount = 0
+
+    // FIX #4: updateWeights theo phiên ID
+    const latestPhien = currentItem.session
+
+    if (predictionLog.length > 0) {
+      const lastEntry = predictionLog[predictionLog.length - 1]
+      if (!lastEntry.actual && lastEntry.phien !== latestPhien) {
+        lastEntry.actual = currentItem.result
+        updateWeights(predictionLog)
+        console.log(`✅ Actual phiên ${lastEntry.phien}: ${lastEntry.actual}`)
+      }
+    }
+
+    history = newHistory
+    console.log(`📦 Phiên ${currentItem.session} | ${currentItem.result} | Tổng ${currentItem.total} | ${history.length} phiên`)
   } catch (e) {
-    // Silent fail
+    loadErrorCount++
+    if (e.response) {
+      console.error(`❌ HTTP ${e.response.status}: ${e.response.statusText}`)
+    } else if (e.code === "ECONNABORTED") {
+      console.error("❌ Timeout khi tải dữ liệu nguồn")
+    } else {
+      console.error("❌ Lỗi load:", e.message)
+    }
+
+    // Retry nhanh hơn nếu lỗi liên tiếp < 5 lần
+    if (loadErrorCount <= 5) {
+      setTimeout(load, 2000)
+    }
   }
 }
 
@@ -393,7 +450,6 @@ setInterval(load, 5000)
 // API ROUTES
 // ============================================================
 
-// GET /api - Dự đoán chính
 app.get("/api", (req, res) => {
   if (history.length === 0) {
     return res.status(503).json({ error: "no_data", message: "Chưa có dữ liệu từ nguồn" })
@@ -406,24 +462,29 @@ app.get("/api", (req, res) => {
   const arr = toResults(history)
   const ai = aiPredict(arr)
 
-  // Lưu dự đoán vào log
-  predictionLog.push({
-    phien: last.session || last.phien || history.length,
-    predict: ai.predict,
-    actual: null,
-    votes: ai.votes,
-    timestamp: Date.now()
-  })
-  if (predictionLog.length > 200) predictionLog.shift()
+  const currentPhien = last.session || last.phien || history.length
+
+  // FIX #2: chỉ push log khi phiên thực sự mới
+  const lastLog = predictionLog[predictionLog.length - 1]
+  if (!lastLog || lastLog.phien !== currentPhien) {
+    predictionLog.push({
+      phien: currentPhien,
+      predict: ai.predict,
+      actual: null,
+      votes: ai.votes,
+      timestamp: Date.now()
+    })
+    if (predictionLog.length > 200) predictionLog.shift()
+  }
 
   res.json({
-    phien: last.session || last.phien || history.length,
+    phien: currentPhien,
     ket_qua: dice,
     tong: total,
     result,
     du_doan: ai.predict,
     do_tin_cay: ai.conf + "%",
-    tin_hieu: ai.signal,      // strong / moderate / weak
+    tin_hieu: ai.signal,
     pattern: ai.pattern,
     streak: ai.streak_len,
     entropy: ai.entropy,
@@ -431,7 +492,6 @@ app.get("/api", (req, res) => {
   })
 })
 
-// GET /api/detail - Chi tiết đầy đủ
 app.get("/api/detail", (req, res) => {
   if (history.length === 0) {
     return res.status(503).json({ error: "no_data" })
@@ -448,7 +508,6 @@ app.get("/api/detail", (req, res) => {
   })
 })
 
-// GET /api/accuracy - Thống kê độ chính xác
 app.get("/api/accuracy", (req, res) => {
   const evaluated = predictionLog.filter(e => e.actual)
   if (evaluated.length === 0) {
@@ -458,7 +517,6 @@ app.get("/api/accuracy", (req, res) => {
   const correct = evaluated.filter(e => e.predict === e.actual).length
   const accuracy = Math.round((correct / evaluated.length) * 100)
 
-  // Accuracy theo từng thuật toán
   const algoStats = {}
   Object.keys(algorithmWeights).forEach(algo => {
     const algoEval = evaluated.filter(e => e.votes && e.votes[algo])
@@ -484,7 +542,7 @@ app.get("/api/accuracy", (req, res) => {
 })
 
 // ============================================================
-// CẦU NHẬN DẠNG - dùng cho /sunlon
+// CẦU NHẬN DẠNG
 // ============================================================
 function detectCau(arr) {
   if (arr.length < 4) return { name: "chưa_đủ_dữ_liệu", predict: arr[arr.length - 1] || "Tài" }
@@ -500,43 +558,45 @@ function detectCau(arr) {
   if (betLen >= 3) {
     return {
       name: "cầu_bệt",
-      predict: w[w.length - 1], // tiếp tục theo cầu bệt
+      predict: w[w.length - 1],
       streak: betLen
     }
   }
 
   // ---- Cầu đan xen: T X T X T X ----
   const last6 = w.slice(-6)
-  const isAlternating = last6.every((v, i) => i === 0 || v !== last6[i - 1])
-  if (isAlternating && last6.length >= 4) {
+  const isAlternating = last6.length >= 4 && last6.every((v, i) => i === 0 || v !== last6[i - 1])
+  if (isAlternating) {
     const next = last6[last6.length - 1] === "Tài" ? "Xỉu" : "Tài"
     return { name: "cầu_đan_xen", predict: next }
   }
 
   // ---- Cầu 1-2: T XX T XX hoặc X TT X TT ----
   const last6str = w.slice(-6).join(",")
-  const p12a = ["Tài,Xỉu,Xỉu,Tài,Xỉu,Xỉu", "Xỉu,Tài,Tài,Xỉu,Tài,Tài"]
-  if (p12a.includes(last6str)) {
+  const p12 = ["Tài,Xỉu,Xỉu,Tài,Xỉu,Xỉu", "Xỉu,Tài,Tài,Xỉu,Tài,Tài"]
+  if (p12.includes(last6str)) {
+    // T XX → tiếp theo là T; X TT → tiếp theo là X
     const next = w[w.length - 1] === "Xỉu" ? "Tài" : "Xỉu"
     return { name: "cầu_1_2", predict: next }
   }
 
   // ---- Cầu 2-1: TT X TT X hoặc XX T XX T ----
-  const p21a = ["Tài,Tài,Xỉu,Tài,Tài,Xỉu", "Xỉu,Xỉu,Tài,Xỉu,Xỉu,Tài"]
-  if (p21a.includes(last6str)) {
-    const next = w[w.length - 1] === "Tài" ? "Xỉu" : "Tài"
-    return { name: "cầu_2_1", predict: w[w.length - 2] } // lặp lại cặp đôi
+  // FIX #1: sau X (kết thúc chu kỳ 2-1) thì tiếp theo là TT → predict T
+  const p21 = ["Tài,Tài,Xỉu,Tài,Tài,Xỉu", "Xỉu,Xỉu,Tài,Xỉu,Xỉu,Tài"]
+  if (p21.includes(last6str)) {
+    // Vừa kết thúc chu kỳ X/T đơn → bắt đầu cặp mới
+    const pairVal = w[w.length - 1] === "Xỉu" ? "Tài" : "Xỉu"
+    return { name: "cầu_2_1", predict: pairVal }
   }
 
   // ---- Cầu 2-2: TT XX TT XX ----
   const last8 = w.slice(-8).join(",")
   const p22 = ["Tài,Tài,Xỉu,Xỉu,Tài,Tài,Xỉu,Xỉu", "Xỉu,Xỉu,Tài,Tài,Xỉu,Xỉu,Tài,Tài"]
   if (p22.includes(last8)) {
-    const next = w[w.length - 1]
-    return { name: "cầu_2_2", predict: next }
+    return { name: "cầu_2_2", predict: w[w.length - 1] }
   }
 
-  // ---- Cầu 3-3: TTT XXX TTT ----
+  // ---- Cầu 3-3: TTT XXX TTT hoặc XXX TTT XXX ----
   const last9 = w.slice(-9).join(",")
   const p33 = [
     "Tài,Tài,Tài,Xỉu,Xỉu,Xỉu,Tài,Tài,Tài",
@@ -546,20 +606,19 @@ function detectCau(arr) {
     return { name: "cầu_3_3", predict: w[w.length - 1] }
   }
 
-  // ---- Cầu gãy: phát hiện vỡ cầu bệt ngắn ----
+  // ---- Cầu gãy: vừa đổi từ streak 2 ----
   if (betLen === 2) {
     const beforeStreak = w[w.length - 3]
     const streakVal = w[w.length - 1]
     if (beforeStreak && beforeStreak !== streakVal) {
-      return { name: "cầu_gãy", predict: streakVal } // vừa đổi, có thể tiếp tục
+      return { name: "cầu_gãy", predict: streakVal }
     }
   }
 
-  // ---- Không nhận dạng được ----
   return { name: "không_rõ_cầu", predict: null }
 }
 
-// GET /sunlon - Dự đoán theo cầu
+// GET /sunlon
 app.get("/sunlon", (req, res) => {
   if (history.length === 0) {
     return res.status(503).json({ error: "no_data", message: "Chưa có dữ liệu từ nguồn" })
@@ -571,19 +630,18 @@ app.get("/sunlon", (req, res) => {
   const result = taiXiu(total)
   const arr = toResults(history)
 
-  // Nhận dạng cầu
   const cau = detectCau(arr)
 
-  // Nếu cầu không rõ, fallback sang AI ensemble
   let duDoan = cau.predict
   let doTinCay = "65%"
+  let usedAI = false
 
   if (!duDoan) {
     const ai = aiPredict(arr)
     duDoan = ai.predict
     doTinCay = ai.conf + "%"
+    usedAI = true
   } else {
-    // Tính độ tin cậy dựa trên loại cầu
     const cauConfMap = {
       "cầu_bệt": 70,
       "cầu_đan_xen": 68,
@@ -604,11 +662,12 @@ app.get("/sunlon", (req, res) => {
     du_doan: duDoan,
     do_tin_cay: doTinCay,
     pattern: cau.name,
+    used_ai_fallback: usedAI,
     id: "@sewdangcap"
   })
 })
 
-// GET /sunlon/detail - Chi tiết cầu
+// GET /sunlon/detail
 app.get("/sunlon/detail", (req, res) => {
   if (history.length === 0) {
     return res.status(503).json({ error: "no_data" })
@@ -627,16 +686,31 @@ app.get("/sunlon/detail", (req, res) => {
   })
 })
 
-// GET /api/history - 50 phiên gần nhất đã xử lý
+// GET /api/history
 app.get("/api/history", (req, res) => {
+  if (history.length === 0) {
+    return res.status(503).json({ error: "no_data", message: "Chưa có dữ liệu" })
+  }
   const arr = toResults(history)
   const last50 = arr.slice(-50)
-  const tCount = last50.filter(x => x === "Tài").length
+  const tCount = last50.filter(v => v === "Tài").length
   res.json({
     total: history.length,
     recent_50: last50,
     tai_ratio: Math.round((tCount / last50.length) * 100) + "%",
     xiu_ratio: Math.round(((last50.length - tCount) / last50.length) * 100) + "%"
+  })
+})
+
+// GET /health - kiểm tra trạng thái server
+app.get("/health", (req, res) => {
+  res.json({
+    status: "ok",
+    history_loaded: history.length,
+    prediction_log: predictionLog.length,
+    load_errors: loadErrorCount,
+    algorithm_weights: algorithmWeights,
+    source: SOURCE
   })
 })
 
